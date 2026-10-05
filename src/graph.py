@@ -267,21 +267,72 @@ class Neo4jGraph:
 
     def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
         """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
-        # TODO KG-3: multi-hop retrieval over YOUR ontology.
-        #   1. self.seed_facts(question, doc_ids) -> (seed_ids, facts)   (ontology-independent, already written)
-        #   2. From the seeds, walk to the other KB through your bridge node (Cypher, see LAB_GUIDE Bước 5)
-        #   3. Append one readable string per fact; return the list.
-        #
-        # HINT (suggested ontology):
-        #   a. Cases that are a seed or next to one -> add f"Vụ việc '{name}': {summary}" to facts
-        #        MATCH (k:Case) WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
-        #   b. For those cases follow
-        #        (Case)-[:CHARGED_WITH]->(Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
-        #      keep clause 1 + clauses that MENTION a Substance the case INVOLVES
-        #   c. Articles named in the question ("Điều 251" -> re.findall(r"[Đđ]iều (\d+)", question)):
-        #      clause 1 + clauses mentioning find_substances(question)
-        #   d. One fact per clause: f"[{article_id} - {title}] khoản {number}: {text}"
-        raise NotImplementedError("TODO KG-3 Neo4jGraph.context (src/graph.py) - kiểm tra: python bench_kg.py --check")
+        seed_ids, facts = self.seed_facts(question, doc_ids)
+
+        # 1. Lấy các Case là seed hoặc nối trực tiếp với seed
+        case_rows = self.run(
+            """
+            MATCH (k:Case)
+            WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
+            RETURN DISTINCT elementId(k) AS id, k.name AS name, coalesce(k.summary, '') AS summary
+            """,
+            ids=seed_ids,
+        )
+        case_ids = [r["id"] for r in case_rows]
+        for r in case_rows:
+            if r.get("summary"):
+                facts.append(f"Vụ việc '{r['name']}': {r['summary']}")
+
+        # 2. Duyệt multi-hop: Case -> Crime <- Article -> Clause
+        if case_ids:
+            clause_rows = self.run(
+                """
+                MATCH (k:Case)-[:CHARGED_WITH]->(c:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE elementId(k) IN $case_ids
+                  AND (
+                    cl.number = 1
+                    OR EXISTS { MATCH (k)-[:INVOLVES]->(sub:Substance)<-[:MENTIONS]-(cl) }
+                    OR toLower($q) CONTAINS 'tối đa'
+                    OR toLower($q) CONTAINS 'cao nhất'
+                  )
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                ORDER BY a.id, cl.number
+                """,
+                case_ids=case_ids, q=question,
+            )
+            for r in clause_rows:
+                facts.append(f"[{r['article_id']} - {r['title']}] khoản {r['number']}: {r['text']}")
+
+        # 3. Xử lý trường hợp câu hỏi nhắc thẳng Điều luật (ví dụ: 'Điều 251')
+        article_nums = re.findall(r"[Đđ]iều\s*(\d+)", question)
+        if article_nums:
+            substances = find_substances(question)
+            art_rows = self.run(
+                """
+                MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE any(num IN $nums WHERE a.id CONTAINS num)
+                  AND (
+                    cl.number = 1
+                    OR any(s IN $substances WHERE EXISTS { MATCH (cl)-[:MENTIONS]->(:Substance {name: s}) })
+                    OR toLower($q) CONTAINS 'tối đa'
+                    OR toLower($q) CONTAINS 'cao nhất'
+                  )
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                ORDER BY a.id, cl.number
+                """,
+                nums=article_nums, substances=substances, q=question,
+            )
+            for r in art_rows:
+                facts.append(f"[{r['article_id']} - {r['title']}] khoản {r['number']}: {r['text']}")
+
+        # 4. Khử trùng lặp và giới hạn max_facts
+        seen = set()
+        unique_facts = []
+        for f in facts:
+            if f not in seen:
+                seen.add(f)
+                unique_facts.append(f)
+        return unique_facts[:max_facts]
 
 # ---------------------------------------------------------------------------------------------- KG-2
 
