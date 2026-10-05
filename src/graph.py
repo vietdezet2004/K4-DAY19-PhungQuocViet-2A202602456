@@ -241,6 +241,7 @@ class Neo4jGraph:
             **article,
         )
 
+
     def add_news_case(self, case: dict, doc: Document) -> None:
         self.run(
             """
